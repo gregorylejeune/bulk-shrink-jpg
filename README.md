@@ -35,7 +35,10 @@ A typical 1800 x 1200 photo (3:2) becomes **800 x 533**. Windows does not stretc
 - **Try / catch on every photo.** One corrupt JPG does not kill a 900-file run.
 - **Originals are sacred.** Source and output must be different folders. Output cannot sit inside source.
 - **Resumable.** Already-shrunk files in the output folder are skipped unless you say overwrite.
-- **No extra software.** Uses Windows GDI+ (`System.Drawing`). Nothing to install.
+- **No extra software.** Uses Windows Image Acquisition (WIA) COM -- `Wia.ImageFile` / `Wia.ImageProcess`. That DLL already lives on Windows (`wiaaut.dll`). Nothing to install, no NuGet, no System.Drawing.
+
+The shrink itself is Microsoft's WIA **Scale** filter: `MaximumWidth = 800`, `MaximumHeight = 600`, `PreserveAspectRatio = yes`. Same bounding box Windows uses for Send to Mail Medium.
+
 
 ---
 
@@ -140,7 +143,7 @@ Hard stops (the script will not continue):
 - Source folder missing or not a directory
 - Source and output are the same path
 - Output is inside the source folder (would mix originals with copies)
-- Not running on Windows / `System.Drawing` cannot load
+- Not running on Windows / WIA COM (`Wia.ImageFile`) cannot load
 
 Soft failures (the batch keeps going):
 
@@ -158,10 +161,21 @@ Each failure is printed in red and listed again in the summary.
 | --- | --- |
 | OS | Windows 10 / 11 (or Windows Server) |
 | Runtime | Windows PowerShell 5.1, or PowerShell 7+ for Windows |
-| Software | None. No ImageMagick, no .NET SDK, no Photoshop. |
-| Files | `*.jpg` and `*.jpeg` (any case — `.JPG` counts) |
+| Software | None. WIA COM ships with Windows. No ImageMagick, no .NET SDK, no Photoshop, no extra modules. |
+| Files | `*.jpg` and `*.jpeg` (any case -- `.JPG` counts) |
 
-macOS and Linux will refuse to run — GDI+ is a Windows API.
+What the script actually calls -- all Microsoft, all already on the box:
+
+| Piece | Source |
+| --- | --- |
+| `Get-ChildItem`, `Copy-Item`, `Test-Path`, `New-Item`, `Read-Host` | Inbox PowerShell modules (`Microsoft.PowerShell.Management`, `Microsoft.PowerShell.Utility`) |
+| `Wia.ImageFile` / `Wia.ImageProcess` | Windows Image Acquisition Automation (`wiaaut.dll`) |
+| Scale / Convert / RotateFlip filters | Same WIA COM library |
+
+Nothing is downloaded. Nothing is registered. If PowerShell opens, this runs.
+
+macOS and Linux will refuse to run -- WIA is a Windows component.
+
 
 ---
 

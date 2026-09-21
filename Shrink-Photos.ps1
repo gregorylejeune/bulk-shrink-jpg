@@ -8,7 +8,11 @@
 # Originals are never overwritten. Failed files are skipped so a 900-photo
 # batch can finish even if a few images are corrupt.
 #
-# Windows only. Uses built-in System.Drawing (GDI+). No extra software required.
+# Windows only. Uses inbox Microsoft pieces exclusively:
+#   - PowerShell cmdlets that ship with Windows
+#   - WIA COM  (Wia.ImageFile / Wia.ImageProcess)  -- wiaaut.dll
+# No NuGet, no ImageMagick, no System.Drawing, nothing to install.
+#
 # Author : Gregory LeJeune
 # Repo   : https://github.com/gregorylejeune/bulk-shrink-jpg
 
@@ -19,6 +23,9 @@ $MaxWidth    = 800
 $MaxHeight   = 600
 $JpegQuality = 85
 
+# WIA JPEG format identifier (Microsoft wiaimgfmt.h / wiaaut.dll).
+$WiaFormatJpeg = '{B96B3CAE-0728-11D3-9D7B-0000F81EF32E}'
+
 function Write-Banner {
     Write-Host ""
     Write-Host "============================================================" -ForegroundColor Cyan
@@ -26,13 +33,14 @@ function Write-Banner {
     Write-Host "  Windows Send-to-Mail Medium  |  fit inside 800 x 600" -ForegroundColor Cyan
     Write-Host "============================================================" -ForegroundColor Cyan
     Write-Host "  Originals are never touched. Output goes to a folder you pick." -ForegroundColor DarkGray
+    Write-Host "  Engine: Windows Image Acquisition (WIA) -- built into Windows." -ForegroundColor DarkGray
     Write-Host ""
 }
 
-function Write-Info    { param([string]$Message) Write-Host $Message -ForegroundColor Gray }
-function Write-Ok      { param([string]$Message) Write-Host $Message -ForegroundColor Green }
-function Write-WarnLine{ param([string]$Message) Write-Host $Message -ForegroundColor Yellow }
-function Write-ErrLine { param([string]$Message) Write-Host $Message -ForegroundColor Red }
+function Write-Info     { param([string]$Message) Write-Host $Message -ForegroundColor Gray }
+function Write-Ok       { param([string]$Message) Write-Host $Message -ForegroundColor Green }
+function Write-WarnLine { param([string]$Message) Write-Host $Message -ForegroundColor Yellow }
+function Write-ErrLine  { param([string]$Message) Write-Host $Message -ForegroundColor Red }
 
 function Format-Bytes {
     param([long]$Bytes)
@@ -80,10 +88,7 @@ function Read-TrimmedPath {
 function Get-FullPathSafe {
     param([Parameter(Mandatory)][string]$Path)
     try {
-        if ([System.IO.Path]::IsPathRooted($Path)) {
-            return [System.IO.Path]::GetFullPath($Path)
-        }
-        return [System.IO.Path]::GetFullPath((Join-Path -Path (Get-Location).Path -ChildPath $Path))
+        return $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Path)
     }
     catch {
         throw "Could not resolve path '$Path'. $($_.Exception.Message)"
@@ -160,59 +165,86 @@ function Test-SameOrNestedPath {
     $src = $Source.TrimEnd('\', '/').ToLowerInvariant()
     $dst = $Destination.TrimEnd('\', '/').ToLowerInvariant()
     if ($src -eq $dst) { return 'same' }
-    $prefix = $src + [System.IO.Path]::DirectorySeparatorChar
+    $prefix = $src + '\'
     if ($dst.StartsWith($prefix)) { return 'nested' }
     return 'ok'
 }
 
-function Get-JpegCodec {
-    $codecs = [System.Drawing.Imaging.ImageCodecInfo]::GetImageEncoders()
-    foreach ($codec in $codecs) {
-        if ($codec.MimeType -eq 'image/jpeg') { return $codec }
-    }
-    throw "This Windows install has no JPEG encoder (System.Drawing)."
-}
-
-function Apply-ExifOrientation {
-    param([Parameter(Mandatory)][System.Drawing.Image]$Image)
-    $orientationId = 0x0112
+function Clear-ComObject {
+    param($ComObject)
+    if ($null -eq $ComObject) { return }
     try {
-        if ($Image.PropertyIdList -notcontains $orientationId) { return }
-        $value = $Image.GetPropertyItem($orientationId).Value[0]
-        switch ($value) {
-            2 { $Image.RotateFlip([System.Drawing.RotateFlipType]::RotateNoneFlipX) }
-            3 { $Image.RotateFlip([System.Drawing.RotateFlipType]::Rotate180FlipNone) }
-            4 { $Image.RotateFlip([System.Drawing.RotateFlipType]::Rotate180FlipX) }
-            5 { $Image.RotateFlip([System.Drawing.RotateFlipType]::Rotate90FlipX) }
-            6 { $Image.RotateFlip([System.Drawing.RotateFlipType]::Rotate90FlipNone) }
-            7 { $Image.RotateFlip([System.Drawing.RotateFlipType]::Rotate270FlipX) }
-            8 { $Image.RotateFlip([System.Drawing.RotateFlipType]::Rotate270FlipNone) }
-        }
-        try { [void]$Image.RemovePropertyItem($orientationId) } catch { }
+        $null = [System.Runtime.InteropServices.Marshal]::ReleaseComObject($ComObject)
     }
     catch {
-        # EXIF is optional. Keep going with the pixels as stored.
+        # Already released or not a COM RCW.
     }
 }
 
-function Save-JpegImage {
-    param(
-        [Parameter(Mandatory)][System.Drawing.Image]$Image,
-        [Parameter(Mandatory)][string]$Path,
-        [Parameter(Mandatory)][long]$Quality
-    )
-    $codec = Get-JpegCodec
-    $encoderParams = New-Object System.Drawing.Imaging.EncoderParameters(1)
+function Test-WiaAvailable {
+    $probe = $null
     try {
-        $encoderParams.Param[0] = New-Object System.Drawing.Imaging.EncoderParameter(
-            [System.Drawing.Imaging.Encoder]::Quality,
-            $Quality
-        )
-        $Image.Save($Path, $codec, $encoderParams)
+        $probe = New-Object -ComObject Wia.ImageFile
+        return $true
+    }
+    catch {
+        throw "Windows Image Acquisition (WIA) is not available. It ships with Windows as wiaaut.dll (Wia.ImageFile). $($_.Exception.Message)"
     }
     finally {
-        $encoderParams.Dispose()
+        Clear-ComObject $probe
     }
+}
+
+function Get-WiaOrientation {
+    param($Image)
+    try {
+        $count = [int]$Image.Properties.Count
+        for ($i = 1; $i -le $count; $i++) {
+            $prop = $null
+            try {
+                $prop = $Image.Properties.Item($i)
+                $id = [int]$prop.PropertyID
+                if ($id -eq 274) {
+                    return [int]$prop.Value
+                }
+            }
+            catch {
+                # Skip unreadable EXIF entries.
+            }
+        }
+    }
+    catch {
+        # No EXIF bag on this file.
+    }
+    return 1
+}
+
+function Set-WiaFilterProperty {
+    param(
+        $Filter,
+        [Parameter(Mandatory)][string]$Name,
+        $Value
+    )
+    try {
+        $Filter.Properties.Item($Name).Value = $Value
+    }
+    catch {
+        throw "WIA filter property '$Name' could not be set. $($_.Exception.Message)"
+    }
+}
+
+function Add-WiaFilter {
+    param(
+        $Process,
+        [Parameter(Mandatory)][string]$Name
+    )
+    try {
+        $Process.Filters.Add($Process.FilterInfos.Item($Name).FilterID)
+    }
+    catch {
+        throw "WIA filter '$Name' is not available on this Windows install. $($_.Exception.Message)"
+    }
+    return [int]$Process.Filters.Count
 }
 
 function Convert-Photo {
@@ -221,79 +253,115 @@ function Convert-Photo {
         [Parameter(Mandatory)][string]$OutputPath
     )
 
-    $src = $null
-    $destBmp = $null
-    $graphics = $null
-    $fileStream = $null
+    $image   = $null
+    $process = $null
+    $result  = $null
 
     try {
-        $fileStream = [System.IO.File]::Open(
-            $InputPath,
-            [System.IO.FileMode]::Open,
-            [System.IO.FileAccess]::Read,
-            [System.IO.FileShare]::Read
-        )
-        $src = [System.Drawing.Image]::FromStream($fileStream)
-        Apply-ExifOrientation -Image $src
+        $image = New-Object -ComObject Wia.ImageFile
+        $image.LoadFile($InputPath)
 
-        $srcW = [double]$src.Width
-        $srcH = [double]$src.Height
+        $srcW = [int]$image.Width
+        $srcH = [int]$image.Height
         if ($srcW -lt 1 -or $srcH -lt 1) {
-            throw "Image has invalid dimensions ($($src.Width) x $($src.Height))."
+            throw "Image has invalid dimensions ($srcW x $srcH)."
         }
 
-        $scale = [Math]::Min(1.0, [Math]::Min(($MaxWidth / $srcW), ($MaxHeight / $srcH)))
-        $newW  = [Math]::Max(1, [int][Math]::Round($srcW * $scale))
-        $newH  = [Math]::Max(1, [int][Math]::Round($srcH * $scale))
+        $orientation = Get-WiaOrientation -Image $image
+        $needsRotate = ($orientation -ge 2 -and $orientation -le 8)
+
+        $dispW = $srcW
+        $dispH = $srcH
+        if ($orientation -eq 5 -or $orientation -eq 6 -or $orientation -eq 7 -or $orientation -eq 8) {
+            $dispW = $srcH
+            $dispH = $srcW
+        }
+        $needsScale = ($dispW -gt $MaxWidth) -or ($dispH -gt $MaxHeight)
 
         $outDir = Split-Path -Parent $OutputPath
         if (-not (Test-Path -LiteralPath $outDir -PathType Container)) {
             New-Item -ItemType Directory -Path $outDir -Force | Out-Null
         }
 
-        if ($scale -ge 1.0) {
-            $copyW = $src.Width
-            $copyH = $src.Height
-            # Release the read lock before copying the original bytes.
-            $src.Dispose(); $src = $null
-            $fileStream.Dispose(); $fileStream = $null
-            [System.IO.File]::Copy($InputPath, $OutputPath, $true)
+        if (-not $needsRotate -and -not $needsScale) {
+            Clear-ComObject $image
+            $image = $null
+            Copy-Item -LiteralPath $InputPath -Destination $OutputPath -Force
             return [pscustomobject]@{
-                Width     = $copyW
-                Height    = $copyH
-                NewWidth  = $copyW
-                NewHeight = $copyH
+                Width     = $srcW
+                Height    = $srcH
+                NewWidth  = $srcW
+                NewHeight = $srcH
                 Action    = 'copied'
             }
         }
 
-        $destBmp = New-Object System.Drawing.Bitmap $newW, $newH
-        $destBmp.SetResolution($src.HorizontalResolution, $src.VerticalResolution)
-        $graphics = [System.Drawing.Graphics]::FromImage($destBmp)
-        $graphics.CompositingMode    = [System.Drawing.Drawing2D.CompositingMode]::SourceCopy
-        $graphics.CompositingQuality = [System.Drawing.Drawing2D.CompositingQuality]::HighQuality
-        $graphics.InterpolationMode  = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
-        $graphics.SmoothingMode      = [System.Drawing.Drawing2D.SmoothingMode]::HighQuality
-        $graphics.PixelOffsetMode    = [System.Drawing.Drawing2D.PixelOffsetMode]::HighQuality
+        $process = New-Object -ComObject Wia.ImageProcess
 
-        $destRect = New-Object System.Drawing.Rectangle 0, 0, $newW, $newH
-        $graphics.DrawImage($src, $destRect, 0, 0, $src.Width, $src.Height, [System.Drawing.GraphicsUnit]::Pixel)
+        if ($needsRotate) {
+            $idx = Add-WiaFilter -Process $process -Name 'RotateFlip'
+            $filter = $process.Filters.Item($idx)
+            $angle = 0
+            $flipH = 0
+            switch ($orientation) {
+                2 { $flipH = 1 }
+                3 { $angle = 180 }
+                4 { $angle = 180; $flipH = 1 }
+                5 { $angle = 90;  $flipH = 1 }
+                6 { $angle = 90 }
+                7 { $angle = 270; $flipH = 1 }
+                8 { $angle = 270 }
+            }
+            Set-WiaFilterProperty -Filter $filter -Name 'RotationAngle'  -Value ([int]$angle)
+            Set-WiaFilterProperty -Filter $filter -Name 'FlipHorizontal' -Value ([int]$flipH)
+            Set-WiaFilterProperty -Filter $filter -Name 'FlipVertical'   -Value 0
+        }
 
-        Save-JpegImage -Image $destBmp -Path $OutputPath -Quality ([long]$JpegQuality)
+        if ($needsScale) {
+            $idx = Add-WiaFilter -Process $process -Name 'Scale'
+            $filter = $process.Filters.Item($idx)
+            Set-WiaFilterProperty -Filter $filter -Name 'MaximumWidth'  -Value ([int]$MaxWidth)
+            Set-WiaFilterProperty -Filter $filter -Name 'MaximumHeight' -Value ([int]$MaxHeight)
+            try {
+                $filter.Properties.Item('PreserveAspectRatio').Value = 1
+            }
+            catch {
+                # Property exists on every current Windows WIA; ignore if an old build lacks it.
+            }
+        }
+
+        $idx = Add-WiaFilter -Process $process -Name 'Convert'
+        $filter = $process.Filters.Item($idx)
+        Set-WiaFilterProperty -Filter $filter -Name 'FormatID' -Value $WiaFormatJpeg
+        try {
+            $filter.Properties.Item('Quality').Value = [int]$JpegQuality
+        }
+        catch {
+            # Quality only applies to JPEG convert; if missing, WIA uses its default.
+        }
+
+        $result = $process.Apply($image)
+        if ($null -eq $result) {
+            throw "WIA returned no image after Apply."
+        }
+
+        if (Test-Path -LiteralPath $OutputPath) {
+            Remove-Item -LiteralPath $OutputPath -Force
+        }
+        $result.SaveFile($OutputPath)
 
         return [pscustomobject]@{
-            Width     = $src.Width
-            Height    = $src.Height
-            NewWidth  = $newW
-            NewHeight = $newH
+            Width     = $dispW
+            Height    = $dispH
+            NewWidth  = [int]$result.Width
+            NewHeight = [int]$result.Height
             Action    = 'resized'
         }
     }
     finally {
-        if ($null -ne $graphics)   { $graphics.Dispose() }
-        if ($null -ne $destBmp)    { $destBmp.Dispose() }
-        if ($null -ne $src)        { $src.Dispose() }
-        if ($null -ne $fileStream) { $fileStream.Dispose() }
+        Clear-ComObject $result
+        Clear-ComObject $process
+        Clear-ComObject $image
     }
 }
 
@@ -305,17 +373,11 @@ $exitCode = 0
 try {
     Write-Banner
 
-    $onWindows = [System.Environment]::OSVersion.Platform -eq 'Win32NT'
-    if (-not $onWindows) {
-        throw "This script uses Windows GDI+ and must be run on Windows PowerShell or PowerShell 7 for Windows."
+    if ($env:OS -ne 'Windows_NT') {
+        throw "This script uses Windows Image Acquisition (WIA) and must be run on Windows PowerShell or PowerShell 7 for Windows."
     }
 
-    try {
-        Add-Type -AssemblyName System.Drawing -ErrorAction Stop
-    }
-    catch {
-        throw "Could not load System.Drawing. $($_.Exception.Message)"
-    }
+    Test-WiaAvailable | Out-Null
 
     $sourceDir = Read-ExistingDirectory -Prompt "Source folder (where the original JPGs are)"
     $outputDir = Read-OutputDirectory   -Prompt "Output folder (where shrunk JPGs will be written)"
@@ -367,6 +429,7 @@ try {
     Write-Host "  Files  : $total JPG$(if ($total -ne 1) { 's' })" -ForegroundColor White
     Write-Host "  Size   : fit inside ${MaxWidth} x ${MaxHeight}  (aspect ratio kept)" -ForegroundColor White
     Write-Host "  JPEG   : quality $JpegQuality" -ForegroundColor White
+    Write-Host "  Engine : WIA (Wia.ImageFile) -- inbox Windows COM" -ForegroundColor White
     Write-Host ""
 
     if (-not (Get-YesNo -Prompt "Start shrinking now?" -Default $true)) {
@@ -380,9 +443,9 @@ try {
     $failed  = 0
     $bytesIn  = [long]0
     $bytesOut = [long]0
-    $failures = New-Object System.Collections.Generic.List[string]
+    $failures = @()
     $index = 0
-    $sourcePrefix = $sourceDir.TrimEnd('\', '/') + [System.IO.Path]::DirectorySeparatorChar
+    $sourcePrefix = $sourceDir.TrimEnd('\', '/') + '\'
 
     Write-Host ""
     foreach ($file in $files) {
@@ -433,7 +496,7 @@ try {
         catch {
             $failed++
             $reason = $_.Exception.Message
-            $failures.Add("$relative  --  $reason") | Out-Null
+            $failures += "$relative  --  $reason"
             Write-ErrLine ("[{0}/{1}] FAIL  {2}  {3}" -f $index, $total, $relative, $reason)
         }
     }
@@ -444,7 +507,7 @@ try {
     Write-Host "============================================================" -ForegroundColor Cyan
     Write-Host "  DONE" -ForegroundColor Cyan
     Write-Host "============================================================" -ForegroundColor Cyan
-    Write-Host ("  Succeeded : {0}" -f $ok)      -ForegroundColor Green
+    Write-Host ("  Succeeded : {0}" -f $ok) -ForegroundColor Green
     if ($copied  -gt 0) { Write-Host ("  Copied    : {0}  (already within 800 x 600)" -f $copied) -ForegroundColor Green }
     if ($skipped -gt 0) { Write-Host ("  Skipped   : {0}  (already in output)" -f $skipped) -ForegroundColor Yellow }
     if ($failed  -gt 0) { Write-Host ("  Failed    : {0}" -f $failed) -ForegroundColor Red }
@@ -476,7 +539,7 @@ finally {
     Write-Progress -Activity "Shrinking photos to 800 x 600" -Completed -ErrorAction SilentlyContinue
 }
 
-if ([Environment]::UserInteractive) {
+if ($Host.Name -eq 'ConsoleHost') {
     Write-Host "Press Enter to exit" -ForegroundColor DarkGray
     try { [void](Read-Host) } catch { }
 }
